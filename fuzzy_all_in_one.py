@@ -1,14 +1,11 @@
-"""
-Fuzzy (Mamdani) — 3 Inputs (CPU/GPU/RAM) -> 3 Outputs (Quality/Resolution/Texture)
-- ไม่ใช้ @dataclass
-- AND = min, OR = max, Implication = min, Aggregation = max, Defuzz = centroid
-- มีตัวแปลงตัวเลข -> ฉลาก (simple + hysteresis)
-"""
 
 import numpy as np
+import matplotlib.pyplot as plt
 from typing import Callable, Dict, List, Tuple
+import pandas as pd
+import os
 
-# -------- Membership helpers --------
+
 def trimf(x, abc):
     a, b, c = abc
     y = np.zeros_like(x, dtype=float)
@@ -32,31 +29,27 @@ def defuzz_centroid(x, mu):
         return 0.5 * (x[0] + x[-1])
     return float(np.trapz(x * mu, x) / area)
 
-# -------- Fuzzy primitives (no dataclass) --------
+
 class FuzzySet:
     def __init__(self, name: str, mf: Callable[[np.ndarray], np.ndarray]):
-        self.name = name          # ชื่อชุดสังกัด เช่น "low" / "mid" / "high"
-        self.mf = mf              # ฟังก์ชัน membership: np.ndarray -> np.ndarray
+        self.name = name
+        self.mf = mf
 
 class FuzzyVar:
     def __init__(self, name: str, universe: np.ndarray, sets: Dict[str, FuzzySet]):
-        self.name = name          # ชื่อตัวแปร เช่น "cpu"
-        self.universe = universe  # แกนค่า (เช่น 0..100)
-        self.sets = sets          # dict: ชื่อเซต -> FuzzySet
+        self.name = name
+        self.universe = universe
+        self.sets = sets
 
     def mu(self, set_name: str, xval: float) -> float:
         xs = self.universe
-        mus = self.sets[set_name].mf(xs)    # membership ของทั้งแกน
-        return float(np.interp(xval, xs, mus))  # ค่าที่ตำแหน่ง x=xval
+        mus = self.sets[set_name].mf(xs)
+        return float(np.interp(xval, xs, mus))
 
 class Rule:
     def __init__(self,
                  antecedent: Callable[[Dict[str, float]], float],
                  consequents: List[Tuple[str, str, float]]):
-        """
-        antecedent: ฟังก์ชันรับ dict อินพุต -> degree [0,1]
-        consequents: ลิสต์ของ (out_var, set_name, weight)
-        """
         self.antecedent = antecedent
         self.consequents = consequents
 
@@ -65,23 +58,21 @@ class MamdaniSystem:
         self.inputs, self.outputs, self.rules = inputs, outputs, rules
 
     def infer(self, x: Dict[str, float]) -> Dict[str, float]:
-        # รวมผลแต่ละเอาต์พุต (aggregation) เป็นกราฟ mu ที่ถูก clip แล้ว
         agg = {name: np.zeros_like(var.universe, dtype=float) for name, var in self.outputs.items()}
         for rule in self.rules:
-            w = float(rule.antecedent(x))   # degree ของ antecedent (0..1)
+            w = float(rule.antecedent(x))
             if w <= 0:
                 continue
             for out_name, set_name, weight in rule.consequents:
                 var = self.outputs[out_name]
                 mu_set = var.sets[set_name].mf(var.universe)
-                clipped = np.minimum(mu_set, w * weight)  # Implication = min (มี weight)
-                agg[out_name] = np.maximum(agg[out_name], clipped)  # Aggregation = max
-        # Defuzzify
+                clipped = np.minimum(mu_set, w * weight)      # implication = min (with weight)
+                agg[out_name] = np.maximum(agg[out_name], clipped)  # aggregation = max
         return {name: defuzz_centroid(var.universe, agg[name]) for name, var in self.outputs.items()}
 
-# -------- Build variables --------
-u  = np.linspace(0, 100, 1001)     # 0..100
-uR = np.linspace(50, 100, 1001)    # 50..100 สำหรับ Resolution Scale
+
+u  = np.linspace(0, 100, 1001)
+uR = np.linspace(50, 100, 1001)     
 
 def mk_perf_sets():
     return {
@@ -122,11 +113,10 @@ outputs = {
     "tex":     FuzzyVar("tex",     u,  tex_sets),
 }
 
-# helper สำหรับ RULES
-def MU(v, s, x):  # degree ของ "v is s" ที่ค่าปัจจุบัน x[v]
+def MU(v, s, x):
     return inputs[v].mu(s, x[v])
 
-# -------- Human-readable rules (อธิบายเป็นภาษาคน) --------
+
 RULES_HUMAN = [
     "R1: IF CPU is HIGH AND GPU is HIGH AND RAM is HIGH THEN Quality is ULTRA, Resolution is HIGH, Texture is HIGH",
     "R2: IF GPU is HIGH AND CPU is MID AND RAM is MID THEN Quality is HIGH, Resolution is HIGH, Texture is MED",
@@ -140,53 +130,33 @@ RULES_HUMAN = [
     "R10: IF CPU is LOW AND GPU is HIGH THEN Quality is MED, Resolution is MED",
 ]
 
-# -------- Machine rules (ใช้ min/max ตรง ๆ) --------
+
 RULES = [
-    # R1
     Rule(lambda x: min(MU('cpu','high',x), MU('gpu','high',x), MU('ram','high',x)),
          [('quality','ultra',1.0), ('res','high',1.0), ('tex','high',1.0)]),
-
-    # R2
     Rule(lambda x: min(MU('gpu','high',x), MU('cpu','mid',x), MU('ram','mid',x)),
          [('quality','high',1.0), ('res','high',1.0), ('tex','med',1.0)]),
-
-    # R3
     Rule(lambda x: min(MU('cpu','mid',x), MU('gpu','mid',x), MU('ram','mid',x)),
          [('quality','med',1.0), ('res','med',1.0), ('tex','med',1.0)]),
-
-    # R4  (OR = max)
     Rule(lambda x: max(MU('gpu','low',x), MU('cpu','low',x)),
          [('quality','low',1.0), ('res','low',1.0)]),
-
-    # R5
     Rule(lambda x: MU('ram','low',x),
          [('tex','low',1.0)]),
-
-    # R6  (มี weight 0.9)
     Rule(lambda x: min(MU('gpu','high',x), MU('ram','mid',x)),
          [('quality','high',0.9), ('res','high',0.9), ('tex','med',1.0)]),
-
-    # R7
     Rule(lambda x: min(MU('cpu','mid',x), MU('gpu','high',x), MU('ram','high',x)),
          [('quality','high',1.0), ('res','high',1.0), ('tex','high',1.0)]),
-
-    # R8
     Rule(lambda x: min(MU('cpu','high',x), MU('gpu','mid',x), MU('ram','high',x)),
          [('quality','high',0.8), ('res','med',1.0), ('tex','high',1.0)]),
-
-    # R9
     Rule(lambda x: min(MU('gpu','mid',x), MU('ram','low',x)),
          [('tex','low',1.0), ('res','low',0.8)]),
-
-    # R10
     Rule(lambda x: min(MU('cpu','low',x), MU('gpu','high',x)),
          [('quality','med',1.0), ('res','med',1.0)]),
 ]
 
-# สร้างระบบ
 system = MamdaniSystem(inputs, outputs, RULES)
 
-# -------- Numeric → Label mapping --------
+# -------- Numeric Label mapping --------
 def quality_label(q: float) -> str:
     if q < 37.5: return "Low"
     if q < 67.5: return "Medium"
@@ -203,12 +173,11 @@ def texture_label(tex: float) -> str:
     if tex < 72.5: return "Medium"
     return "High"
 
-# -------- Hysteresis mappers (กันกระพริบ) --------
+# -------- Hysteresis mappers --------
 class HysteresisMapper:
     def __init__(self, levels, rise, fall, initial=None):
         self.levels, self.rise, self.fall = levels, rise, fall
         self.idx = 0 if initial is None else levels.index(initial)
-
     def update(self, x: float) -> str:
         while self.idx < len(self.rise) and x >= self.rise[self.idx]:
             self.idx += 1
@@ -220,13 +189,11 @@ quality_mapper = HysteresisMapper(["Low","Medium","High","Ultra"], [40.0, 70.0, 
 res_mapper     = HysteresisMapper(["Low","Medium","High"],          [75.0, 90.0],       [70.0, 88.0])
 tex_mapper     = HysteresisMapper(["Low","Medium","High"],          [50.0, 75.0],       [45.0, 70.0])
 
-# -------- Public APIs --------
+
 def infer(cpu: float, gpu: float, ram: float) -> Dict[str, float]:
-    """คืนค่าเอาต์พุตแบบตัวเลข (crisp)"""
     return system.infer({"cpu": cpu, "gpu": gpu, "ram": ram})
 
 def infer_with_labels(cpu: float, gpu: float, ram: float, use_hysteresis: bool = False) -> Dict[str, object]:
-    """คืนทั้งตัวเลข + ฉลาก (เลือกกันกระพริบได้)"""
     out = infer(cpu, gpu, ram)
     if use_hysteresis:
         qlbl = quality_mapper.update(out["quality"])
@@ -246,8 +213,180 @@ def infer_with_labels(cpu: float, gpu: float, ram: float, use_hysteresis: bool =
 def get_rules_text() -> str:
     return "\n".join(RULES_HUMAN)
 
-# -------- Quick test --------
+def plot_memberships(var, title, filename=None):
+    plt.figure()
+    for name, fset in var.sets.items():
+        plt.plot(var.universe, fset.mf(var.universe), label=name)
+    plt.title(title)
+    plt.xlabel(var.name)
+    plt.ylabel("μ")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    if filename:
+        plt.savefig(filename, dpi=160)
+        plt.close()
+    else:
+        plt.show()
+
+def demo_defuzz(cpu=70, gpu=80, ram=65, out_name="quality", filename=None):
+    x = {"cpu": cpu, "gpu": gpu, "ram": ram}
+    agg = np.zeros_like(outputs[out_name].universe, dtype=float)
+    for rule in RULES:
+        w = float(rule.antecedent(x))
+        if w <= 0: 
+            continue
+        for o_name, set_name, weight in rule.consequents:
+            if o_name != out_name:
+                continue
+            var = outputs[o_name]
+            mu = var.sets[set_name].mf(var.universe)
+            clipped = np.minimum(mu, w * weight)
+            agg = np.maximum(agg, clipped)
+    xs = outputs[out_name].universe
+    c = defuzz_centroid(xs, agg)
+
+    plt.figure()
+    for name, fset in outputs[out_name].sets.items():
+        plt.plot(xs, fset.mf(xs), label=name)
+    plt.plot(xs, agg, label="aggregated")
+    plt.axvline(c, label=f"centroid={c:.2f}")
+    plt.title(f"Defuzzification demo ({out_name}) @ CPU={cpu}, GPU={gpu}, RAM={ram}")
+    plt.xlabel(out_name)
+    plt.ylabel("μ")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    if filename:
+        plt.savefig(filename, dpi=160)
+        plt.close()
+    else:
+        plt.show()
+    return c
+
+def plot_heatmap(x_name, y_name, out_name, fixed, filename=None):
+    nx = 80; ny = 80
+    xs = np.linspace(0, 100, nx)
+    ys = np.linspace(0, 100, ny)
+    Z = np.zeros((ny, nx), dtype=float)
+    for j, yv in enumerate(ys):
+        for i, xv in enumerate(xs):
+            sample = {**fixed, x_name: float(xv), y_name: float(yv)}
+            val = infer(sample["cpu"], sample["gpu"], sample["ram"])[out_name]
+            Z[j, i] = val
+    plt.figure()
+    plt.imshow(Z, origin="lower", extent=[xs.min(), xs.max(), ys.min(), ys.max()], aspect="auto")
+    plt.colorbar(label=f"{out_name} (crisp)")
+    plt.xlabel(x_name.upper())
+    plt.ylabel(y_name.upper())
+    fixed_txt = ", ".join(f"{k.upper()}={v}" for k,v in fixed.items())
+    plt.title(f"{out_name} heatmap ({x_name.upper()}×{y_name.upper()} | {fixed_txt})")
+    plt.tight_layout()
+    if filename:
+        plt.savefig(filename, dpi=160)
+        plt.close()
+    else:
+        plt.show()
+
+def sensitivity_curve(vary, fixed, out_names=("quality","res","tex"), filename=None):
+    xs = np.linspace(0,100,101)
+    plt.figure()
+    for out_name in out_names:
+        ys = []
+        for xval in xs:
+            sample = {**fixed, vary: float(xval)}
+            out = infer(sample["cpu"], sample["gpu"], sample["ram"])
+            ys.append(out[out_name])
+        plt.plot(xs, ys, label=out_name)
+    plt.title(f"Sensitivity: vary {vary.upper()} | fixed " + ", ".join(f"{k.upper()}={v}" for k,v in fixed.items()))
+    plt.xlabel(vary.upper())
+    plt.ylabel("crisp output")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    if filename:
+        plt.savefig(filename, dpi=160)
+        plt.close()
+    else:
+        plt.show()
+
+def random_stats(n=300, csv_path="fuzzy_sim_results.csv", fig_hist=None, fig_bar=None):
+    rng = np.random.default_rng(42)
+    rows = []
+    lblQ = {"Low":0,"Medium":0,"High":0,"Ultra":0}
+    lblR = {"Low":0,"Medium":0,"High":0}
+    lblT = {"Low":0,"Medium":0,"High":0}
+    Q, R, T = [], [], []
+    for _ in range(n):
+        cpu = float(rng.uniform(5,95))
+        gpu = float(rng.uniform(5,95))
+        ram = float(rng.uniform(5,95))
+        out = infer_with_labels(cpu, gpu, ram, use_hysteresis=False)
+        rows.append(out)
+        Q.append(out["quality_idx"]); lblQ[out["quality_lbl"]] += 1
+        R.append(out["res_scale_%"]); lblR[out["res_label"]] += 1
+        T.append(out["texture_idx"]); lblT[out["texture_lbl"]] += 1
+
+    df = pd.DataFrame(rows)
+    df.to_csv(csv_path, index=False, encoding="utf-8")
+
+    # Histogram of Quality
+    plt.figure()
+    plt.hist(Q, bins=15)
+    plt.title("Histogram of Quality Index")
+    plt.xlabel("Quality (0–100)")
+    plt.ylabel("count")
+    plt.tight_layout()
+    if fig_hist:
+        plt.savefig(fig_hist, dpi=160)
+        plt.close()
+    else:
+        plt.show()
+
+    # Bar: Quality label distribution
+    plt.figure()
+    xs = list(lblQ.keys()); ys = [lblQ[k] for k in xs]
+    plt.bar(xs, ys)
+    plt.title("Quality label distribution")
+    plt.xlabel("label")
+    plt.ylabel("count")
+    plt.tight_layout()
+    if fig_bar:
+        plt.savefig(fig_bar, dpi=160)
+        plt.close()
+    else:
+        plt.show()
+
+    return df
+
+# -------- Main: generate everything --------
 if __name__ == "__main__":
-    print(infer_with_labels(90, 40, 95))            # ทดสอบ
+    outdir = os.getcwd()
+
+    # Example inference
+    print(infer_with_labels(90, 40, 95))
     print("--- Rules ---")
     print(get_rules_text())
+
+    # 1) Memberships
+    plot_memberships(inputs["cpu"], "CPU score memberships", os.path.join(outdir, "fig_membership_cpu.png"))
+    plot_memberships(inputs["gpu"], "GPU score memberships", os.path.join(outdir, "fig_membership_gpu.png"))
+    plot_memberships(inputs["ram"], "RAM score memberships", os.path.join(outdir, "fig_membership_ram.png"))
+    plot_memberships(outputs["quality"], "Output: Graphics Quality memberships", os.path.join(outdir, "fig_membership_quality.png"))
+    plot_memberships(outputs["res"], "Output: Resolution Scale memberships", os.path.join(outdir, "fig_membership_res.png"))
+    plot_memberships(outputs["tex"], "Output: Texture Quality memberships", os.path.join(outdir, "fig_membership_tex.png"))
+
+    # 2) Defuzz demo (quality)
+    demo_defuzz(70, 80, 65, "quality", os.path.join(outdir, "fig_defuzz_quality_demo.png"))
+
+    # 3) Heatmaps
+    plot_heatmap("cpu","gpu","quality", fixed={"cpu":0,"gpu":0,"ram":70}, filename=os.path.join(outdir, "fig_heatmap_quality_cpu_gpu_ram70.png"))
+    plot_heatmap("gpu","ram","res", fixed={"cpu":70,"gpu":0,"ram":0}, filename=os.path.join(outdir, "fig_heatmap_res_gpu_ram_cpu70.png"))
+    plot_heatmap("ram","gpu","tex", fixed={"cpu":70,"gpu":0,"ram":0}, filename=os.path.join(outdir, "fig_heatmap_tex_ram_gpu_cpu70.png"))
+
+    # 4) Sensitivity
+    sensitivity_curve("gpu", {"cpu":70,"gpu":0,"ram":70},
+                      filename=os.path.join(outdir, "fig_sensitivity_vary_gpu_fix_cpu70_ram70.png"))
+
+    # 5) Random stats + CSV
+    random_stats(n=300,
+                 csv_path=os.path.join(outdir, "fuzzy_sim_results.csv"),
+                 fig_hist=os.path.join(outdir, "fig_hist_quality.png"),
+                 fig_bar=os.path.join(outdir, "fig_bar_quality_labels.png"))
